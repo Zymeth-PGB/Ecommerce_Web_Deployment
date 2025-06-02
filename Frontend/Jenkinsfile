@@ -1,0 +1,131 @@
+pipeline {
+    agent none
+    environment {
+        USER_PROJECT = "bee-ecommerce"
+        CI_COMMIT_SHORT_SHA = ""
+        CI_COMMIT_TAG = ""
+        CI_PROJECT_NAME = ""
+        IMAGE_VERSION = ""
+        CURRENT_DIR = ""
+        TRIVYFS_REPORT = ""
+        TRIVY_IMAGE_REPORT = ""
+        SNYKSCAN_REPORT = ""
+        ARACHNI_WEBSITE_REPORT = ""
+        K6_PERFORMANCE_TEST_REPORT = ""
+    }
+    stages {
+        stage('Get information project') {
+            agent {
+                label '192.168.152.141'
+            }
+            steps {
+                script {
+                    CI_PROJECT_NAME = sh(script: "git remote show origin -n | grep Fetch | cut -d'/' -f5 | cut -d'.' -f1", returnStdout: true).trim()
+                    def CI_COMMIT_HASH = sh(script: "git rev-parse HEAD", returnStdout: true).trim()
+                    CI_COMMIT_SHORT_SHA = CI_COMMIT_HASH.take(8)
+                    CI_COMMIT_TAG = sh(script: "git describe --tags --exact-match ${CI_COMMIT_HASH}", returnStdout: true).trim()
+                    IMAGE_VERSION = "${CI_PROJECT_NAME}:${CI_COMMIT_SHORT_SHA}_${CI_COMMIT_TAG}"
+                    TRIVY_IMAGE_REPORT = "security_scan_image_${USER_PROJECT}_${CI_COMMIT_SHORT_SHA}_${CI_COMMIT_TAG}_report"
+                    TRIVYFS_REPORT = "trivyfs_scan_${USER_PROJECT}_${CI_COMMIT_SHORT_SHA}_${CI_COMMIT_TAG}_report"
+                    SNYKSCAN_REPORT = "snykscan_${USER_PROJECT}_${CI_COMMIT_SHORT_SHA}_${CI_COMMIT_TAG}_report"
+                    ARACHNI_WEBSITE_REPORT = "security_scan_website_${USER_PROJECT}_${CI_COMMIT_SHORT_SHA}_${CI_COMMIT_TAG}_report"
+                    K6_PERFORMANCE_TEST_REPORT = "performance_test_${USER_PROJECT}_${CI_COMMIT_SHORT_SHA}_${CI_COMMIT_TAG}_report"
+                    CURRENT_DIR = sh(script: "pwd", returnStdout: true).trim()
+                }
+            }
+        }
+        stage('Build') {
+            agent {
+                label '192.168.152.141'
+            }
+            steps {
+                script {
+                    def runningContainers = sh(script: "docker ps --format '{{.ID}} {{.Names}}' | grep -v 'backend' | awk '{print \$1}'", returnStdout: true).trim()
+                    if (runningContainers) {
+                        sh(script: """docker stop \$(docker ps --format '{{.ID}} {{.Names}}' | grep -v 'backend' | awk '{print \$1}')""", label: "Stop non-backend containers")
+                    }
+
+                    def allContainers = sh(script: """docker ps -a --format '{{.ID}} {{.Names}}' | grep -v 'backend' | awk '{print \$1}'""", returnStdout: true).trim()
+                    if (allContainers) {
+                        sh(script: """docker rm -f \$(docker ps -a --format '{{.ID}} {{.Names}}' | grep -v 'backend' | awk '{print \$1}')""", label: "Remove non-backend containers")
+                    }
+
+                    def allImages = sh(script: """docker images --format '{{.ID}} {{.Repository}}' | grep -v 'backend' | awk '{print \$1}'""", returnStdout: true).trim()
+                    if (allImages) {
+                        sh(script: """docker rmi -f \$(docker images --format '{{.ID}} {{.Repository}}' | grep -v 'backend' | awk '{print \$1}')""", label: "Remove non-backend images")
+                    }
+                        
+                    sh(script: """ docker build -t ${IMAGE_VERSION} . """, label: "")
+                }
+            }
+        }
+        stage('Test source code with Snyk') {
+            agent {
+                label '192.168.152.141'
+            }
+            steps {
+                script {
+                    sh(script: """ docker build --rm --network host --build-arg SNYK_AUTH_TOKEN=${SNYK_TOKEN} --build-arg OUTPUT_FILENAME=${SNYKSCAN_REPORT}.html -t ${SNYKSCAN_REPORT} -f Dockerfile-snyk . """, label: "")
+                    sh(script: """ docker create --name ${SNYKSCAN_REPORT} ${SNYKSCAN_REPORT} """, label: "")
+                    sh(script: """ docker cp ${SNYKSCAN_REPORT}:/app/${SNYKSCAN_REPORT}.html . """, label: "")
+                }
+            }
+        }
+        stage('Test source code with Trivy FS') {
+            agent {
+                label '192.168.152.141'
+            }
+            steps {
+                script {
+                    sh(script: """ docker run --rm --user \$(id -u):\$(id -g) -e HOME=/tmp -v $PWD:/${CI_PROJECT_NAME} -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy fs ${CI_PROJECT_NAME} --severity HIGH,CRITICAL --format template --template "@contrib/html.tpl" --output /${CI_PROJECT_NAME}/${TRIVYFS_REPORT}.html """, label: "")
+                }
+            }
+        }
+        stage('Scan image with Trivy') {
+            agent {
+                label '192.168.152.141'
+            }
+            steps {
+                script {
+                    sh(script: """ docker run --rm -v \$(pwd):/${CI_PROJECT_NAME} -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy clean --all """, label: "")
+                    sh(script: """ docker run --rm -v \$(pwd):/${CI_PROJECT_NAME} -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy image --format template --template "@contrib/html.tpl" --output /${CI_PROJECT_NAME}/${TRIVY_IMAGE_REPORT}.html ${IMAGE_VERSION} """, label: "")
+                }
+            }
+        }
+        stage('Deploy') {
+            agent {
+                label '192.168.152.141'
+            }
+            steps {
+                script {
+                    sh(script: """ sudo su ${USER_PROJECT} -c "docker run --name ${CI_PROJECT_NAME} -dp ${FE_PORT} ${IMAGE_VERSION}" """, label: "")
+                }
+            }
+        }
+        stage('Website security scan with Arachni') {
+            agent {
+                label '192.168.152.141'
+            }
+            steps {
+                script {
+                    sh(script: """ docker run --rm -v /tmp/:/tmp/ phangiabao/arachni:v1.4-0.5.10 bin/arachni --output-verbose --scope-include-subdomains ${ADDRESS_FRONTEND} --report-save-path=/tmp/${ARACHNI_WEBSITE_REPORT}.arf > /dev/null 2>&1 """, label: "")
+                    sh(script: """ docker run --rm -v /tmp/:/tmp/ phangiabao/arachni:v1.4-0.5.10 bin/arachni_reporter /tmp/${ARACHNI_WEBSITE_REPORT}.arf --reporter=html:outfile=/tmp/${ARACHNI_WEBSITE_REPORT}.html.zip """, label: "")
+                    sh(script: """ sudo chmod 777 /tmp/${ARACHNI_WEBSITE_REPORT}.html.zip """, label: "")
+                    sh(script: """ cp /tmp/${ARACHNI_WEBSITE_REPORT}.html.zip . """, label: "")
+                }
+            }
+        }
+        stage('Performance testing with K6') {
+            agent {
+                label '192.168.152.141'
+            }
+            steps {
+                script {
+                    sh(script: """ chmod -R 777 ./performance_testing_script/ || true """, label: "")
+                    sh(script: """ docker run --rm -v \$(pwd)/performance_testing_script:/performance_testing_script loadimpact/k6 run -e RESULTS_PATH=/performance_testing_script --summary-export=/performance_testing_script/summary_perf.json /performance_testing_script/smoke-test.js """, label: "")
+                    sh(script: """ cat ./performance_testing_script/summary_perf.json | jq -r '["metric", "avg", "min", "med", "max", "p(90)", "p(95)"], (.metrics | to_entries[] | [.key, .value.avg, .value.min, .value.med, .value.max, .value["p(90)"], .value["p(95)"]]) | @csv' > ${K6_PERFORMANCE_TEST_REPORT}.csv """, label: "")
+                }
+            }
+        }
+    }
+}
