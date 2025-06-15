@@ -14,6 +14,14 @@ pipeline {
         K6_PERFORMANCE_TEST_REPORT = ""
     }
     stages {
+        stage('Clean workspace') {
+            agent {
+                label '192.168.152.141'
+            }
+            steps {
+                cleanWs()
+            }
+        }
         stage('Get information project') {
             agent {
                 label '192.168.152.141'
@@ -39,22 +47,7 @@ pipeline {
                 label '192.168.152.141'
             }
             steps {
-                script {
-                    def runningContainers = sh(script: "docker ps --format '{{.ID}} {{.Names}}' | grep -v 'backend' | awk '{print \$1}'", returnStdout: true).trim()
-                    if (runningContainers) {
-                        sh(script: """docker stop \$(docker ps --format '{{.ID}} {{.Names}}' | grep -v 'backend' | awk '{print \$1}')""", label: "Stop non-backend containers")
-                    }
-
-                    def allContainers = sh(script: """docker ps -a --format '{{.ID}} {{.Names}}' | grep -v 'backend' | awk '{print \$1}'""", returnStdout: true).trim()
-                    if (allContainers) {
-                        sh(script: """docker rm -f \$(docker ps -a --format '{{.ID}} {{.Names}}' | grep -v 'backend' | awk '{print \$1}')""", label: "Remove non-backend containers")
-                    }
-
-                    def allImages = sh(script: """docker images --format '{{.ID}} {{.Repository}}' | grep -v 'backend' | awk '{print \$1}'""", returnStdout: true).trim()
-                    if (allImages) {
-                        sh(script: """docker rmi -f \$(docker images --format '{{.ID}} {{.Repository}}' | grep -v 'backend' | awk '{print \$1}')""", label: "Remove non-backend images")
-                    }
-                        
+                script {  
                     sh(script: """ docker build -t ${IMAGE_VERSION} . """, label: "")
                 }
             }
@@ -65,7 +58,7 @@ pipeline {
             }
             steps {
                 script {
-                    sh(script: """ docker build --rm --network host --build-arg SNYK_AUTH_TOKEN=${SNYK_TOKEN} --build-arg OUTPUT_FILENAME=${SNYKSCAN_REPORT}.html -t ${SNYKSCAN_REPORT} -f Dockerfile-snyk . """, label: "")
+                    sh(script: """ docker build --rm --build-arg SNYK_AUTH_TOKEN=${SNYK_TOKEN} --build-arg OUTPUT_FILENAME=${SNYKSCAN_REPORT}.html -t ${SNYKSCAN_REPORT} -f Dockerfile-snyk . """, label: "")
                     sh(script: """ docker create --name ${SNYKSCAN_REPORT} ${SNYKSCAN_REPORT} """, label: "")
                     sh(script: """ docker cp ${SNYKSCAN_REPORT}:/app/${SNYKSCAN_REPORT}.html . """, label: "")
                 }
@@ -77,7 +70,7 @@ pipeline {
             }
             steps {
                 script {
-                    sh(script: """ docker run --rm --user \$(id -u):\$(id -g) -e HOME=/tmp -v $PWD:/${CI_PROJECT_NAME} -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy fs ${CI_PROJECT_NAME} --severity HIGH,CRITICAL --format template --template "@contrib/html.tpl" --output /${CI_PROJECT_NAME}/${TRIVYFS_REPORT}.html """, label: "")
+                    sh(script: """ docker run --rm --user \$(id -u):\$(id -g) -e HOME=/tmp -v \$(pwd):/${CI_PROJECT_NAME} -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy fs ${CI_PROJECT_NAME} --severity HIGH,CRITICAL --format template --template "@contrib/html.tpl" --output /${CI_PROJECT_NAME}/${TRIVYFS_REPORT}.html """, label: "")
                 }
             }
         }
@@ -98,7 +91,7 @@ pipeline {
             }
             steps {
                 script {
-                    sh(script: """ sudo su ${USER_PROJECT} -c "docker run --name ${CI_PROJECT_NAME} -dp ${FE_PORT} ${IMAGE_VERSION}" """, label: "")
+                    sh(script: """ sudo su ${USER_PROJECT} -c "docker rm -f ${CI_PROJECT_NAME}; docker run --name ${CI_PROJECT_NAME} -dp ${FE_PORT} ${IMAGE_VERSION}" """, label: "")
                 }
             }
         }
@@ -108,10 +101,9 @@ pipeline {
             }
             steps {
                 script {
-                    sh(script: """ docker run --rm -v /tmp/:/tmp/ phangiabao/arachni:v1.4-0.5.10 bin/arachni --output-verbose --scope-include-subdomains ${ADDRESS_FRONTEND} --report-save-path=/tmp/${ARACHNI_WEBSITE_REPORT}.arf > /dev/null 2>&1 """, label: "")
-                    sh(script: """ docker run --rm -v /tmp/:/tmp/ phangiabao/arachni:v1.4-0.5.10 bin/arachni_reporter /tmp/${ARACHNI_WEBSITE_REPORT}.arf --reporter=html:outfile=/tmp/${ARACHNI_WEBSITE_REPORT}.html.zip """, label: "")
-                    sh(script: """ sudo chmod 777 /tmp/${ARACHNI_WEBSITE_REPORT}.html.zip """, label: "")
-                    sh(script: """ cp /tmp/${ARACHNI_WEBSITE_REPORT}.html.zip . """, label: "")
+                    sh(script: """ docker run --rm -v \$(pwd):/tmp/ phangiabao/arachni:v1.4-0.5.10 bin/arachni --output-verbose --scope-include-subdomains ${ADDRESS_FRONTEND} --report-save-path=/tmp/${ARACHNI_WEBSITE_REPORT}.arf > /dev/null 2>&1 """, label: "")
+                    sh(script: """ docker run --rm -v \$(pwd):/tmp/ phangiabao/arachni:v1.4-0.5.10 bin/arachni_reporter /tmp/${ARACHNI_WEBSITE_REPORT}.arf --reporter=html:outfile=/tmp/${ARACHNI_WEBSITE_REPORT}.html.zip """, label: "")
+                    sh(script: """ sudo chown jenkins:jenkins ${ARACHNI_WEBSITE_REPORT}.html.zip """, label: "")
                 }
             }
         }
@@ -121,9 +113,46 @@ pipeline {
             }
             steps {
                 script {
-                    sh(script: """ chmod -R 777 ./performance_testing_script/ || true """, label: "")
                     sh(script: """ docker run --rm -v \$(pwd)/performance_testing_script:/performance_testing_script loadimpact/k6 run -e RESULTS_PATH=/performance_testing_script --summary-export=/performance_testing_script/summary_perf.json /performance_testing_script/smoke-test.js """, label: "")
                     sh(script: """ cat ./performance_testing_script/summary_perf.json | jq -r '["metric", "avg", "min", "med", "max", "p(90)", "p(95)"], (.metrics | to_entries[] | [.key, .value.avg, .value.min, .value.med, .value.max, .value["p(90)"], .value["p(95)"]]) | @csv' > ${K6_PERFORMANCE_TEST_REPORT}.csv """, label: "")
+                }
+            }
+        }
+        stage('Clean Docker Resources') {
+            agent {
+                label '192.168.152.141'
+            }
+            steps {
+                script {
+                    def runningContainers = sh(script: "docker ps --format '{{.ID}} {{.Names}}' | grep ${USER_PROJECT} | awk '{print \$1}'", returnStdout: true).trim()
+                    if (runningContainers) {
+                        sh(script: """docker stop \$(docker ps --format '{{.ID}} {{.Names}}' | grep ${USER_PROJECT} | awk '{print \$1}')""", label: "Stop non-backend containers")
+                    }
+
+                    def allContainers = sh(script: """docker ps -a --format '{{.ID}} {{.Names}}' | grep ${USER_PROJECT} | awk '{print \$1}'""", returnStdout: true).trim()
+                    if (allContainers) {
+                        sh(script: """docker rm -f \$(docker ps -a --format '{{.ID}} {{.Names}}' | grep ${USER_PROJECT} | awk '{print \$1}')""", label: "Remove non-backend containers")
+                    }
+
+                    sh(script: "docker image prune -a -f", label: "")
+                }
+            }
+        }
+        stage('Send Message And Upload Report To Slack') {
+            agent {
+                label '192.168.152.141'
+            }
+            steps {
+                script {
+                    def status = currentBuild.currentResult
+                    if (status == 'SUCCESS') {
+                        slackSend channel: "#bee-ecommerce", color: "good", message: "Build and deploy successful! (Frontend)"
+                        slackUploadFile filePath: "*.html", channel: "#bee-ecommerce", initialComment: "File uploaded from Jenkins"
+                        slackUploadFile filePath: "*.zip", channel: "#bee-ecommerce", initialComment: "File uploaded from Jenkins"
+                        slackUploadFile filePath: "*.csv", channel: "#bee-ecommerce", initialComment: "File uploaded from Jenkins"
+                    } else if (status == 'FAILURE') {
+                        slackSend channel: "#bee-ecommerce", color: "danger", message: "Build and deploy failed!"
+                    }
                 }
             }
         }
