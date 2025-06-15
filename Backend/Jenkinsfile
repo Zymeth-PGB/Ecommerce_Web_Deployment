@@ -12,6 +12,14 @@ pipeline {
         SNYKSCAN_REPORT = ""
     }
     stages {
+        stage('Clean workspace') {
+            agent {
+                label '192.168.152.141'
+            }
+            steps {
+                cleanWs()
+            }
+        }
         stage('Get information project') {
             agent {
                 label '192.168.152.141'
@@ -36,21 +44,6 @@ pipeline {
             }
             steps {
                 script {
-                    def runningContainers = sh(script: "docker ps --format '{{.ID}} {{.Names}}' | grep -v 'frontend' | awk '{print \$1}'", returnStdout: true).trim()
-                    if (runningContainers) {
-                        sh(script: "docker stop \$(docker ps --format '{{.ID}} {{.Names}}' | grep -v 'frontend' | awk '{print \$1}')", label: "Stop non-backend containers")
-                    }
-
-                    def allContainers = sh(script: "docker ps -a --format '{{.ID}} {{.Names}}' | grep -v 'frontend' | awk '{print \$1}'", returnStdout: true).trim()
-                    if (allContainers) {
-                        sh(script: "docker rm -f \$(docker ps -a --format '{{.ID}} {{.Names}}' | grep -v 'frontend' | awk '{print \$1}')", label: "Remove non-backend containers")
-                    }
-
-                    def allImages = sh(script: "docker images --format '{{.ID}} {{.Repository}}' | grep -v 'frontend' | awk '{print \$1}'", returnStdout: true).trim()
-                    if (allImages) {
-                        sh(script: "docker rmi -f \$(docker images --format '{{.ID}} {{.Repository}}' | grep -v 'frontend' | awk '{print \$1}')", label: "Remove non-backend images")
-                    }
-
                     sh(script: """ docker build -t ${IMAGE_VERSION} . """, label: "")
                 }
             }
@@ -73,7 +66,7 @@ pipeline {
             }
             steps {
                 script {
-                    sh(script: """ docker run --rm --user \$(id -u):\$(id -g) -e HOME=/tmp -v $PWD:/${CI_PROJECT_NAME} -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy fs ${CI_PROJECT_NAME} --severity HIGH,CRITICAL --format template --template "@contrib/html.tpl" --output /${CI_PROJECT_NAME}/${TRIVYFS_REPORT}.html """, label: "")
+                    sh(script: """ docker run --rm --user \$(id -u):\$(id -g) -e HOME=/tmp -v \$(pwd):/${CI_PROJECT_NAME} -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy fs ${CI_PROJECT_NAME} --severity HIGH,CRITICAL --format template --template "@contrib/html.tpl" --output /${CI_PROJECT_NAME}/${TRIVYFS_REPORT}.html """, label: "")
                 }
             }
         }
@@ -94,7 +87,43 @@ pipeline {
             }
             steps {
                 script {
-                    sh(script: """ sudo su ${USER_PROJECT} -c "docker run --name ${CI_PROJECT_NAME} -dp ${BE_PORT} ${IMAGE_VERSION}" """, label: "")
+                    sh(script: """ sudo su ${USER_PROJECT} -c "docker rm -f ${CI_PROJECT_NAME}; docker run --name ${CI_PROJECT_NAME} -dp ${BE_PORT} ${IMAGE_VERSION}" """, label: "")
+                }
+            }
+        }
+        stage('Clean Docker Resources') {
+            agent {
+                label '192.168.152.141'
+            }
+            steps {
+                script {
+                    def runningContainers = sh(script: "docker ps --format '{{.ID}} {{.Names}}' | grep ${USER_PROJECT} | awk '{print \$1}'", returnStdout: true).trim()
+                    if (runningContainers) {
+                        sh(script: "docker stop \$(docker ps --format '{{.ID}} {{.Names}}' | grep ${USER_PROJECT} | awk '{print \$1}')", label: "")
+                    }
+
+                    def allContainers = sh(script: "docker ps -a --format '{{.ID}} {{.Names}}' | grep ${USER_PROJECT} | awk '{print \$1}'", returnStdout: true).trim()
+                    if (allContainers) {
+                        sh(script: "docker rm -f \$(docker ps -a --format '{{.ID}} {{.Names}}' | grep ${USER_PROJECT} | awk '{print \$1}')", label: "")
+                    }
+
+                    sh(script: "docker image prune -a -f", label: "")
+                }
+            }
+        }
+        stage('Send Message And Upload Report To Slack') {
+            agent {
+                label '192.168.152.141'
+            }
+            steps {
+                script {
+                    def status = currentBuild.currentResult
+                    if (status == 'SUCCESS') {
+                        slackSend channel: "#bee-ecommerce", color: "good", message: "Build and deploy successful! (Backend)"
+                        slackUploadFile filePath: "*.html", channel: "#bee-ecommerce", initialComment: "File uploaded from Jenkins"
+                    } else if (status == 'FAILURE') {
+                        slackSend channel: "#bee-ecommerce", color: "danger", message: "Build and deploy failed!"
+                    }
                 }
             }
         }
